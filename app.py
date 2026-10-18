@@ -74,8 +74,7 @@ response = requests.get(
 
 response.raise_for_status()
 payload = response.json()
-
-    if response.status_code == 401:
+if response.status_code == 401:
         raise PermissionError(
             "API authentication failed. Check the API key in "
             "Streamlit Secrets and api_config.php."
