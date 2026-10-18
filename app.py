@@ -184,8 +184,7 @@ def fetch_palay_prices(api_url, api_key):
 
 @st.cache_resource
 def load_model_bundle(model_path, modified_time):
-    # modified_time allows Streamlit to reload the model
-    # when the file changes.
+    # Reload when the model file changes.
     del modified_time
     return joblib.load(model_path)
 
@@ -229,16 +228,11 @@ def get_model_bundle():
 
         return bundle, None
 
-except Exception as exc:
-    st.error("Unable to load price data.")
-    st.write("Error type:", type(exc).__name__)
-    st.code(repr(exc))
-
-    if exc.__cause__ is not None:
-        st.write("Original error:")
-        st.code(repr(exc.__cause__))
-
-    st.stop()
+    except Exception as exc:
+        return None, (
+            f"Could not load trained model: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 # ============================================================
