@@ -1,0 +1,15 @@
+{
+  "model_type": "LinearRegression",
+  "source_csv": "palay_price_prediction_dataset.csv",
+  "monthly_price_rows": 84,
+  "supervised_rows": 83,
+  "train_rows": 71,
+  "test_rows": 12,
+  "test_period_start": "2025-01-01",
+  "test_period_end": "2025-12-01",
+  "mae_pesos_per_kg": 0.0963,
+  "rmse_pesos_per_kg": 0.1156,
+  "persistence_baseline_mae_pesos_per_kg": 0.19,
+  "model_beats_baseline": true,
+  "warning": "Historical test metrics do not guarantee future accuracy. Retrain after adding verified observed prices."
+}
