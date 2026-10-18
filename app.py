@@ -60,34 +60,35 @@ def fetch_palay_prices(api_url, api_key):
             "Missing PALAY_PRICE_API_URL or PALAY_PRICE_API_KEY "
             "in Streamlit Secrets."
         )
-response = requests.get(
-    api_url,
-    headers={
-    "X-API-Key": api_key,
-        "Accept": "application/json",
-        "User-Agent": "AgriTrackPriceApp/1.0",
-        "Connection": "close",
-    },
-    timeout=30,
-)
-response.raise_for_status()
-payload = response.json()
 
-except requests.exceptions.RequestException as e:
-        st.error(
-            "Could not connect to the Agritrack API."
+    try:
+        response = requests.get(
+            api_url,
+            headers={
+                "X-API-Key": api_key,
+                "Accept": "application/json",
+                "User-Agent": "AgriTrackPriceApp/1.0",
+                "Connection": "close",
+            },
+            timeout=30,
+        )
+
+        if response.status_code == 401:
+            raise PermissionError(
+                "API authentication failed. Check the API key in "
+                "Streamlit Secrets and api_config.php."
+            )
+
+        response.raise_for_status()
+
+    except PermissionError:
+        raise
+
+    except requests.exceptions.RequestException as exc:
+        raise ConnectionError(
+            "Could not connect to the AgriTrack API. "
             "Check the API URL, hosting status, and network connection."
-        )
-st.code(str(e))
-st.stop()
-
-if response.status_code == 401:
-        raise PermissionError(
-            "API authentication failed. Check the API key in "
-            "Streamlit Secrets and api_config.php."
-        )
-
-    response.raise_for_status()
+        ) from exc
 
     try:
         payload = response.json()
@@ -157,12 +158,10 @@ if response.status_code == 401:
 
     df = df[df["palay_price_per_kg"] > 0].copy()
 
-    # Normalize every record to the first day of its month.
     df["price_date"] = (
         df["price_date"].dt.to_period("M").dt.to_timestamp()
     )
 
-    # Combine any duplicate months into a single monthly average.
     df = (
         df.groupby("price_date", as_index=False)
         .agg(
@@ -178,7 +177,6 @@ if response.status_code == 401:
     )
 
     return df
-
 
 # ============================================================
 # 4. LOAD THE TRAINED MODEL
