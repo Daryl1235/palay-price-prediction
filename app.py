@@ -1,16 +1,13 @@
 
-from __future__ import annotations
-
-import os
-from datetime import date
 from pathlib import Path
+import calendar
+import os
 
+import joblib
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 
 # ============================================================
@@ -18,20 +15,219 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 # ============================================================
 
 st.set_page_config(
-    page_title="AgriTrack | Palay Price Prediction",
+    page_title="AgriTrack Palay Price Prediction",
     page_icon="🌾",
     layout="wide",
-    initial_sidebar_state="expanded",
+)
+
+BASE_DIR = Path(__file__).resolve().parent
+
+MODEL_PATH = BASE_DIR / "palay_price_model.joblib"
+METRICS_PATH = BASE_DIR / "model_metrics.json"
+
+st.title("🌾 AgriTrack Palay Price Prediction")
+st.caption(
+    "Monthly palay selling-price history and model-based forecasts "
+    "using AgriTrack farmer records."
 )
 
 
 # ============================================================
-# 2. CONFIGURATION
+# 2. API CONFIGURATION
 # ============================================================
 
-APP_TITLE = "AgriTrack Palay Price Prediction"
-MIN_HISTORY_MONTHS = 24
-DEFAULT_HORIZON = 6
+def get_secret(name, default=""):
+    """Read a Streamlit Secret, then fall back to environment."""
+    try:
+        value = st.secrets.get(name, default)
+    except Exception:
+        value = default
+
+    return str(value or os.getenv(name, default)).strip()
+
+
+API_URL = get_secret("PALAY_PRICE_API_URL")
+API_KEY = get_secret("PALAY_PRICE_API_KEY")
+
+
+# ============================================================
+# 3. LOAD ACTUAL SELLING PRICES FROM BYETHOST API
+# ============================================================
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_palay_prices(api_url, api_key):
+    if not api_url or not api_key:
+        raise ValueError(
+            "Missing PALAY_PRICE_API_URL or PALAY_PRICE_API_KEY "
+            "in Streamlit Secrets."
+        )
+
+    response = requests.get(
+        api_url,
+        headers={"X-API-Key": api_key},
+        timeout=30,
+    )
+
+    if response.status_code == 401:
+        raise PermissionError(
+            "API authentication failed. Check the API key in "
+            "Streamlit Secrets and api_config.php."
+        )
+
+    response.raise_for_status()
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ValueError(
+            "The API did not return valid JSON."
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("Unexpected API response format.")
+
+    if not payload.get("success"):
+        raise ValueError(
+            payload.get("message", "The API returned an error.")
+        )
+
+    records = payload.get("data", [])
+
+    if not isinstance(records, list):
+        raise ValueError("The API data field is not a list.")
+
+    df = pd.DataFrame(records)
+
+    required_columns = [
+        "price_date",
+        "palay_price_per_kg",
+    ]
+
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "price_date",
+                "palay_price_per_kg",
+                "record_count",
+            ]
+        )
+
+    missing = [
+        col for col in required_columns
+        if col not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "API response is missing columns: "
+            + ", ".join(missing)
+        )
+
+    df["price_date"] = pd.to_datetime(
+        df["price_date"], errors="coerce"
+    )
+
+    df["palay_price_per_kg"] = pd.to_numeric(
+        df["palay_price_per_kg"], errors="coerce"
+    )
+
+    if "record_count" not in df.columns:
+        df["record_count"] = 0
+
+    df["record_count"] = pd.to_numeric(
+        df["record_count"], errors="coerce"
+    ).fillna(0).astype(int)
+
+    df = df.dropna(
+        subset=["price_date", "palay_price_per_kg"]
+    )
+
+    df = df[df["palay_price_per_kg"] > 0].copy()
+
+    # Normalize every record to the first day of its month.
+    df["price_date"] = (
+        df["price_date"].dt.to_period("M").dt.to_timestamp()
+    )
+
+    # Combine any duplicate months into a single monthly average.
+    df = (
+        df.groupby("price_date", as_index=False)
+        .agg(
+            palay_price_per_kg=("palay_price_per_kg", "mean"),
+            record_count=("record_count", "sum"),
+        )
+        .sort_values("price_date")
+        .reset_index(drop=True)
+    )
+
+    df["palay_price_per_kg"] = (
+        df["palay_price_per_kg"].round(2)
+    )
+
+    return df
+
+
+# ============================================================
+# 4. LOAD THE TRAINED MODEL
+# ============================================================
+
+@st.cache_resource
+def load_model_bundle(model_path, modified_time):
+    # modified_time allows Streamlit to reload the model
+    # when the file changes.
+    del modified_time
+    return joblib.load(model_path)
+
+
+def get_model_bundle():
+    if not MODEL_PATH.exists():
+        return None, (
+            f"Model file not found: {MODEL_PATH.name}. "
+            "Train the model and include this file in your "
+            "GitHub repository."
+        )
+
+    try:
+        bundle = load_model_bundle(
+            str(MODEL_PATH),
+            MODEL_PATH.stat().st_mtime,
+        )
+
+        if not isinstance(bundle, dict):
+            return None, (
+                "The model file is not a dictionary bundle. "
+                "Check the output format of train_model.py."
+            )
+
+        required_keys = [
+            "model",
+            "feature_columns",
+            "origin_date",
+        ]
+
+        missing = [
+            key for key in required_keys
+            if key not in bundle
+        ]
+
+        if missing:
+            return None, (
+                "The trained model bundle is missing: "
+                + ", ".join(missing)
+            )
+
+        return bundle, None
+
+    except Exception as exc:
+        return None, (
+            "Unable to load the trained model: "
+            + str(exc)
+        )
+
+
+# ============================================================
+# 5. FEATURE ENGINEERING
+# ============================================================
 
 FEATURE_COLUMNS = [
     "current_price",
@@ -44,281 +240,42 @@ FEATURE_COLUMNS = [
 ]
 
 
-# ============================================================
-# 3. STYLING
-# ============================================================
-
-st.markdown(
+def make_features(prices, target_date, origin_date):
     """
-    <style>
-    .main-header {
-        padding: 1.2rem 1.4rem;
-        border-radius: 14px;
-        background: linear-gradient(120deg, #164b2c, #39834c);
-        color: white;
-        margin-bottom: 1.2rem;
-    }
+    Create the seven features expected by the trained model.
 
-    .main-header h1 {
-        color: white;
-        margin-bottom: 0.35rem;
-    }
-
-    .main-header p {
-        color: #edf8ef;
-        margin-bottom: 0;
-    }
-
-    .info-card {
-        border: 1px solid #dce7dd;
-        border-radius: 12px;
-        padding: 16px;
-        background: #f7faf7;
-        margin-bottom: 12px;
-    }
-
-    .small-note {
-        color: #66756a;
-        font-size: 0.9rem;
-    }
-
-    div[data-testid="stMetric"] {
-        border: 1px solid #e1e8e1;
-        border-radius: 10px;
-        padding: 12px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# 4. API SETTINGS
-# ============================================================
-
-def get_secret(name: str, default: str = "") -> str:
-    """Read configuration from Streamlit Secrets or environment."""
-
-    try:
-        value = st.secrets.get(name, default)
-    except Exception:
-        value = default
-
-    if value:
-        return str(value).strip()
-
-    return os.environ.get(name, default).strip()
-
-
-API_URL = get_secret("PALAY_PRICE_API_URL")
-API_KEY = get_secret("PALAY_PRICE_API_KEY")
-
-
-# ============================================================
-# 5. LOAD SELLING PRICES FROM AGRITRACK MYSQL API
-# ============================================================
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_agritrack_prices(api_url: str, api_key: str):
+    prices: observed and/or recursively forecast monthly prices.
+    target_date: month being predicted.
+    origin_date: reference date saved by train_model.py.
     """
-    Fetch monthly selling prices from the existing
-    farm_activities table through palay_price_api.php.
-    """
+    target_date = pd.Timestamp(target_date)
+    origin_date = pd.Timestamp(origin_date)
 
-    if not api_url or not api_key:
+    target_date = target_date.to_period("M").to_timestamp()
+    origin_date = origin_date.to_period("M").to_timestamp()
+
+    history = prices.sort_index()
+
+    if history.empty:
+        raise ValueError("No prices available for prediction.")
+
+    # Get the latest known monthly prices before the target month.
+    history = history[history.index < target_date]
+
+    if history.empty:
         raise ValueError(
-            "API configuration is missing. Configure "
-            "PALAY_PRICE_API_URL and PALAY_PRICE_API_KEY "
-            "in Streamlit Secrets."
+            "No prior monthly price is available for this forecast."
         )
 
-    response = requests.get(
-        api_url,
-        headers={"X-API-Key": api_key},
-        timeout=30,
-    )
+    values = history.astype(float).tolist()
 
-    response.raise_for_status()
+    current_price = values[-1]
+    previous_price = values[-2] if len(values) >= 2 else values[-1]
 
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise ValueError(
-            "The API did not return valid JSON. "
-            "Check palay_price_api.php."
-        ) from exc
+    avg_3_month = float(np.mean(values[-3:]))
+    avg_6_month = float(np.mean(values[-6:]))
 
-    if not isinstance(payload, dict):
-        raise ValueError("Unexpected API response format.")
-
-    if payload.get("success") is not True:
-        raise ValueError(
-            payload.get("message", "The API request failed.")
-        )
-
-    records = payload.get("data", [])
-
-    if not isinstance(records, list):
-        raise ValueError(
-            "The API data field must contain a list of records."
-        )
-
-    if not records:
-        return pd.DataFrame(
-            columns=[
-                "price_date",
-                "palay_price_per_kg",
-                "record_count",
-            ]
-        )
-
-    df = pd.DataFrame(records)
-
-    required_columns = [
-        "price_date",
-        "palay_price_per_kg",
-    ]
-
-    missing_columns = [
-        column
-        for column in required_columns
-        if column not in df.columns
-    ]
-
-    if missing_columns:
-        raise ValueError(
-            "Missing API columns: "
-            + ", ".join(missing_columns)
-        )
-
-    df["price_date"] = pd.to_datetime(
-        df["price_date"],
-        errors="coerce",
-    )
-
-    df["palay_price_per_kg"] = pd.to_numeric(
-        df["palay_price_per_kg"],
-        errors="coerce",
-    )
-
-    if "record_count" not in df.columns:
-        df["record_count"] = 1
-
-    df["record_count"] = pd.to_numeric(
-        df["record_count"],
-        errors="coerce",
-    ).fillna(1)
-
-    df = df.dropna(
-        subset=["price_date", "palay_price_per_kg"]
-    )
-
-    df = df[df["palay_price_per_kg"] > 0].copy()
-
-    if df.empty:
-        return df
-
-    # Normalize every date to the first day of its month.
-    df["price_date"] = (
-        df["price_date"].dt.to_period("M").dt.to_timestamp()
-    )
-
-    # Combine any duplicate monthly rows safely.
-    # The PHP API normally already returns monthly averages.
-    df = (
-        df.groupby("price_date", as_index=False)
-        .agg(
-            palay_price_per_kg=("palay_price_per_kg", "mean"),
-            record_count=("record_count", "sum"),
-        )
-        .sort_values("price_date")
-        .reset_index(drop=True)
-    )
-
-    return df
-
-
-# ============================================================
-# 6. CHECK MONTHLY HISTORY
-# ============================================================
-
-def check_monthly_history(df: pd.DataFrame):
-    """
-    Do not invent missing monthly prices.
-    Require consecutive monthly observations before forecasting.
-    """
-
-    if df.empty:
-        return False, "No valid selling-price records were found."
-
-    if len(df) < MIN_HISTORY_MONTHS:
-        return (
-            False,
-            f"Only {len(df)} monthly price observations are "
-            f"available. At least {MIN_HISTORY_MONTHS} "
-            "consecutive months are required before this app "
-            "will generate a forecast.",
-        )
-
-    periods = pd.PeriodIndex(
-        df["price_date"],
-        freq="M",
-    )
-
-    expected_periods = pd.period_range(
-        start=periods.min(),
-        end=periods.max(),
-        freq="M",
-    )
-
-    missing_periods = expected_periods.difference(periods)
-
-    if len(missing_periods) > 0:
-        examples = ", ".join(
-            str(period)
-            for period in list(missing_periods[:5])
-        )
-
-        return (
-            False,
-            "Some months have no recorded selling prices. "
-            f"Missing month(s): {examples}. The app will not "
-            "fill those months with invented prices. Record "
-            "actual selling prices for the missing months "
-            "before generating a forecast.",
-        )
-
-    return True, "Monthly history is ready for model training."
-
-
-# ============================================================
-# 7. CREATE MODEL FEATURES
-# ============================================================
-
-def make_feature_row(
-    prices: list[float],
-    target_month: pd.Timestamp,
-    origin_month: pd.Timestamp,
-) -> dict:
-    """
-    Build features using only prices observed before the
-    month being predicted.
-
-    prices:
-        Historical monthly prices followed by any earlier
-        predictions when forecasting recursively.
-    """
-
-    target_month = pd.Timestamp(target_month)
-    origin_month = pd.Timestamp(origin_month)
-
-    if len(prices) < 6:
-        raise ValueError(
-            "At least six preceding monthly prices are required."
-        )
-
-    month_number = target_month.month
+    month_number = target_date.month
 
     month_sin = np.sin(
         2 * np.pi * month_number / 12
@@ -329,16 +286,16 @@ def make_feature_row(
     )
 
     time_index = (
-        (target_month.year - origin_month.year) * 12
-        + target_month.month
-        - origin_month.month
+        (target_date.year - origin_date.year) * 12
+        + target_date.month
+        - origin_date.month
     )
 
     return {
-        "current_price": float(prices[-1]),
-        "previous_price": float(prices[-2]),
-        "avg_3_month": float(np.mean(prices[-3:])),
-        "avg_6_month": float(np.mean(prices[-6:])),
+        "current_price": float(current_price),
+        "previous_price": float(previous_price),
+        "avg_3_month": float(avg_3_month),
+        "avg_6_month": float(avg_6_month),
         "month_sin": float(month_sin),
         "month_cos": float(month_cos),
         "time_index": float(time_index),
@@ -346,624 +303,350 @@ def make_feature_row(
 
 
 # ============================================================
-# 8. BUILD TRAINING DATA FROM LIVE API HISTORY
+# 6. GENERATE MONTHLY FORECASTS
 # ============================================================
 
-def build_training_data(
-    monthly: pd.DataFrame,
-):
-    """
-    Create supervised learning samples from the actual monthly
-    prices retrieved from AgriTrack.
-
-    No external training CSV is used by this function.
-    """
-
-    prices = monthly["palay_price_per_kg"].astype(float).tolist()
-
-    origin_month = pd.Timestamp(
-        monthly["price_date"].iloc[0]
-    )
-
-    feature_rows = []
-    target_values = []
-
-    # A target month's features use the six preceding months.
-    for target_index in range(6, len(prices)):
-        target_month = pd.Timestamp(
-            monthly["price_date"].iloc[target_index]
-        )
-
-        historical_prices = prices[:target_index]
-
-        feature_row = make_feature_row(
-            prices=historical_prices,
-            target_month=target_month,
-            origin_month=origin_month,
-        )
-
-        feature_rows.append(feature_row)
-        target_values.append(prices[target_index])
-
-    X = pd.DataFrame(
-        feature_rows,
-        columns=FEATURE_COLUMNS,
-    )
-
-    y = np.asarray(target_values, dtype=float)
-
-    return X, y, origin_month
-
-
-# ============================================================
-# 9. EVALUATE MODEL USING A CHRONOLOGICAL HOLDOUT
-# ============================================================
-
-def evaluate_model(X: pd.DataFrame, y: np.ndarray):
-    """
-    Compare Linear Regression against a last-observed-price
-    baseline on the latest portion of the historical samples.
-    """
-
-    sample_count = len(X)
-
-    if sample_count < 5:
-        return None
-
-    test_count = max(1, int(np.ceil(sample_count * 0.20)))
-
-    if sample_count - test_count < 3:
-        return None
-
-    split_index = sample_count - test_count
-
-    X_train = X.iloc[:split_index]
-    X_test = X.iloc[split_index:]
-
-    y_train = y[:split_index]
-    y_test = y[split_index:]
-
-    evaluation_model = LinearRegression()
-    evaluation_model.fit(X_train, y_train)
-
-    predictions = evaluation_model.predict(X_test)
-
-    # The current_price feature is the latest observed price.
-    baseline_predictions = X_test["current_price"].to_numpy()
-
-    mae = float(
-        mean_absolute_error(y_test, predictions)
-    )
-
-    rmse = float(
-        np.sqrt(mean_squared_error(y_test, predictions))
-    )
-
-    baseline_mae = float(
-        mean_absolute_error(y_test, baseline_predictions)
-    )
-
-    return {
-        "mae": mae,
-        "rmse": rmse,
-        "baseline_mae": baseline_mae,
-        "beats_baseline": mae < baseline_mae,
-        "test_months": test_count,
-    }
-
-
-# ============================================================
-# 10. TRAIN ON ALL AVAILABLE MONTHLY HISTORY
-# ============================================================
-
-def train_live_model(monthly: pd.DataFrame):
-    X, y, origin_month = build_training_data(monthly)
-
-    if len(X) < 5:
+def forecast_prices(history_df, bundle, horizon):
+    if len(history_df) < 6:
         raise ValueError(
-            "There are too few training examples. "
-            "More monthly selling-price history is required."
+            "At least 6 distinct monthly prices are required "
+            "for this app's forecast safeguard. More historical "
+            "months are recommended for reliable predictions."
         )
 
-    evaluation = evaluate_model(X, y)
+    model = bundle["model"]
+    feature_columns = list(bundle["feature_columns"])
+    origin_date = pd.Timestamp(bundle["origin_date"])
 
-    model = LinearRegression()
-    model.fit(X, y)
+    if not set(feature_columns).issubset(FEATURE_COLUMNS):
+        raise ValueError(
+            "The saved model uses feature names that this app "
+            "does not recognize. Make sure train_model.py and "
+            "app.py use the same feature definitions."
+        )
 
-    return model, X, y, origin_month, evaluation
+    prices = history_df.set_index(
+        "price_date"
+    )["palay_price_per_kg"].astype(float)
 
+    prices.index = pd.DatetimeIndex(prices.index)
 
-# ============================================================
-# 11. FORECAST FUTURE MONTHS
-# ============================================================
-
-def forecast_months(
-    monthly: pd.DataFrame,
-    model: LinearRegression,
-    origin_month: pd.Timestamp,
-    horizon: int,
-):
-    """
-    Predict the next months recursively using the model trained
-    from actual AgriTrack monthly selling-price history.
-    """
-
-    historical_prices = (
-        monthly["palay_price_per_kg"].astype(float).tolist()
-    )
-
-    last_observed_month = pd.Timestamp(
-        monthly["price_date"].iloc[-1]
-    )
-
+    last_date = prices.index.max()
     forecast_rows = []
 
     for step in range(1, horizon + 1):
-        target_month = (
-            last_observed_month
-            + pd.DateOffset(months=step)
-        )
+        target_date = (
+            last_date.to_period("M") + step
+        ).to_timestamp()
 
-        feature_row = make_feature_row(
-            prices=historical_prices,
-            target_month=target_month,
-            origin_month=origin_month,
+        features = make_features(
+            prices=prices,
+            target_date=target_date,
+            origin_date=origin_date,
         )
 
         feature_frame = pd.DataFrame(
-            [feature_row],
-            columns=FEATURE_COLUMNS,
+            [[features[name] for name in feature_columns]],
+            columns=feature_columns,
         )
 
-        predicted_price = float(
-            model.predict(feature_frame)[0]
+        prediction = float(
+            np.asarray(model.predict(feature_frame)).reshape(-1)[0]
         )
 
-        # A price cannot be negative.
-        predicted_price = max(0.0, predicted_price)
-
-        previous_price = historical_prices[-1]
-
-        change = predicted_price - previous_price
-
-        if change > 0.005:
-            direction = "Possible increase"
-        elif change < -0.005:
-            direction = "Possible decrease"
-        else:
-            direction = "Little or no change"
+        # Selling prices cannot be negative.
+        prediction = max(0.0, prediction)
 
         forecast_rows.append(
             {
-                "Forecast Month": target_month,
-                "Predicted Price (PHP/kg)": round(
-                    predicted_price, 2
-                ),
-                "Previous Month Price (PHP/kg)": round(
-                    previous_price, 2
-                ),
-                "Change (PHP/kg)": round(change, 2),
-                "Direction": direction,
+                "price_date": target_date,
+                "predicted_price_per_kg": round(prediction, 2),
             }
         )
 
-        # Use the forecast as the latest value for the next step.
-        historical_prices.append(predicted_price)
+        # Recursive forecast: the prediction becomes the next
+        # month's current/previous-price input.
+        prices.loc[target_date] = prediction
 
     return pd.DataFrame(forecast_rows)
 
 
 # ============================================================
-# 12. HEADER
+# 7. API CONNECTION AND HISTORICAL PRICE DISPLAY
 # ============================================================
 
-st.markdown(
-    """
-    <div class="main-header">
-        <h1>🌾 AgriTrack Palay Price Prediction</h1>
-        <p>
-            Analyze recorded palay selling prices and explore
-            possible future monthly price trends.
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+st.subheader("1. Actual Farmer Selling Prices")
 
-
-# ============================================================
-# 13. SIDEBAR
-# ============================================================
-
-with st.sidebar:
-    st.header("Prediction Settings")
-
-    horizon = st.selectbox(
-        "Forecast period",
-        options=[3, 6, 12],
-        index=1,
-        format_func=lambda value: f"Next {value} months",
+if not API_URL or not API_KEY:
+    st.error(
+        "API settings are missing. Add PALAY_PRICE_API_URL and "
+        "PALAY_PRICE_API_KEY under Streamlit Cloud → Settings → Secrets."
     )
-
-    st.divider()
-
-    st.markdown("### Data source")
-    st.caption("AgriTrack MySQL → farm_activities")
-
-    st.markdown("### Model")
-    st.caption("Linear Regression")
-
-    st.markdown("### Data requirement")
-    st.caption(
-        f"At least {MIN_HISTORY_MONTHS} consecutive months "
-        "of actual selling-price observations."
-    )
-
-    refresh_clicked = st.button(
-        "Refresh selling prices",
-        use_container_width=True,
-    )
-
-    if refresh_clicked:
-        load_agritrack_prices.clear()
-        st.rerun()
-
-
-# ============================================================
-# 14. LOAD API DATA
-# ============================================================
+    st.stop()
 
 try:
-    with st.spinner(
-        "Loading selling prices from AgriTrack..."
-    ):
-        monthly = load_agritrack_prices(
-            API_URL,
-            API_KEY,
-        )
+    with st.spinner("Loading selling prices from AgriTrack..."):
+        historical_df = fetch_palay_prices(API_URL, API_KEY)
 
-except requests.exceptions.Timeout:
-    st.error(
-        "The AgriTrack API took too long to respond. "
-        "Please try refreshing the selling prices."
-    )
-    st.stop()
-
-except requests.exceptions.HTTPError as exc:
-    status_code = (
-        exc.response.status_code
-        if exc.response is not None
-        else "unknown"
-    )
-
-    if status_code == 401:
-        st.error(
-            "API authentication failed. Check that the API key "
-            "in Streamlit Secrets matches api_config.php."
-        )
-    elif status_code == 500:
-        st.error(
-            "The PHP API encountered a server error. "
-            "Check the SQL query and PHP error log."
-        )
-    else:
-        st.error(
-            f"The API returned HTTP status {status_code}."
-        )
-
-    st.stop()
-
-except requests.exceptions.RequestException:
-    st.error(
-        "Unable to connect to the AgriTrack API. "
-        "Check the API URL and your internet connection."
-    )
-    st.stop()
-
-except ValueError as exc:
+except PermissionError as exc:
     st.error(str(exc))
+    st.info(
+        "The API URL can return Unauthorized when opened directly "
+        "in a browser. The Streamlit request must send the "
+        "X-API-Key header."
+    )
+    st.stop()
+
+except requests.RequestException as exc:
+    st.error(
+        "Could not connect to the AgriTrack API. "
+        "Check the API URL, hosting status, and network connection."
+    )
+    st.caption(str(exc))
     st.stop()
 
 except Exception as exc:
-    st.error(
-        "An unexpected error occurred while loading prices: "
-        f"{exc}"
-    )
+    st.error("Unable to load price data.")
+    st.caption(str(exc))
     st.stop()
 
 
-st.success(
-    "Connected to the AgriTrack selling-price API."
-)
-
-
-# ============================================================
-# 15. HANDLE EMPTY DATA
-# ============================================================
-
-if monthly.empty:
+if historical_df.empty:
     st.warning(
-        "No valid selling prices were returned by the API. "
-        "Check that farmers have saved Post-Harvest selling "
-        "records containing a positive price_per_kg value."
+        "The API connected successfully, but no valid selling "
+        "prices were returned. Check the farmer's Post-Harvest "
+        "selling records in farm_activities."
     )
-
-    st.info(
-        "Once real selling records are available, they will "
-        "appear here automatically after the next refresh."
-    )
-
     st.stop()
 
 
-# ============================================================
-# 16. DISPLAY HISTORY SUMMARY
-# ============================================================
+latest_row = historical_df.iloc[-1]
+latest_price = float(latest_row["palay_price_per_kg"])
 
-first_month = pd.Timestamp(monthly["price_date"].min())
-last_month = pd.Timestamp(monthly["price_date"].max())
+metric_cols = st.columns(3)
 
-total_records = int(monthly["record_count"].sum())
-
-latest_price = float(
-    monthly["palay_price_per_kg"].iloc[-1]
-)
-
-average_price = float(
-    monthly["palay_price_per_kg"].mean()
-)
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric(
-    "Monthly Observations",
-    f"{len(monthly)}",
-)
-
-col2.metric(
+metric_cols[0].metric(
     "Latest Recorded Price",
     f"₱{latest_price:,.2f}/kg",
 )
 
-col3.metric(
-    "Average Monthly Price",
-    f"₱{average_price:,.2f}/kg",
+metric_cols[1].metric(
+    "Monthly Records",
+    f"{len(historical_df)}",
 )
 
-col4.metric(
-    "Selling Records",
-    f"{total_records:,}",
-)
-
-st.caption(
-    f"Observed monthly history: "
-    f"{first_month.strftime('%B %Y')} to "
-    f"{last_month.strftime('%B %Y')}."
-)
-
-
-# ============================================================
-# 17. DISPLAY ACTUAL SELLING PRICE HISTORY
-# ============================================================
-
-st.subheader("Recorded Palay Selling Prices")
-
-st.write(
-    "These monthly averages come from farmers' saved "
-    "Post-Harvest selling records in AgriTrack."
-)
-
-history_display = monthly.rename(
-    columns={
-        "price_date": "Month",
-        "palay_price_per_kg": "Average Price (PHP/kg)",
-        "record_count": "Selling Records",
-    }
-).copy()
-
-history_display["Month"] = (
-    pd.to_datetime(history_display["Month"])
-    .dt.strftime("%B %Y")
-)
-
-history_display["Average Price (PHP/kg)"] = (
-    history_display["Average Price (PHP/kg)"]
-    .round(2)
-)
-
-history_display["Selling Records"] = (
-    history_display["Selling Records"].astype(int)
+metric_cols[2].metric(
+    "Selling Entries",
+    f"{int(historical_df['record_count'].sum()):,}",
 )
 
 st.dataframe(
-    history_display,
-    use_container_width=True,
-    hide_index=True,
-)
-
-st.line_chart(
-    monthly.set_index("price_date")[
-        ["palay_price_per_kg"]
-    ].rename(
+    historical_df.rename(
         columns={
-            "palay_price_per_kg": "Recorded Price (PHP/kg)"
+            "price_date": "Month",
+            "palay_price_per_kg": "Average Price (₱/kg)",
+            "record_count": "Selling Records",
         }
     ),
     use_container_width=True,
-)
-
-
-# ============================================================
-# 18. DATA SUFFICIENCY CHECK
-# ============================================================
-increase_df = forecast_df[
-    forecast_df["direction"] == "Increase"
-]
-
-first_increase = (
-    increase_df.iloc[0]
-    if not increase_df.empty
-    else None
-)
-
-if first_increase is not None:
-    st.success(
-        f"The first predicted increase is in "
-        f"{first_increase['forecast_month'].strftime('%B %Y')}: "
-        f"₱{first_increase['predicted_price']:,.2f}/kg, "
-        f"up by approximately "
-        f"₱{first_increase['price_change']:,.2f}/kg "
-        "from the preceding month."
-    )
-else:
-    st.info(
-        "The model did not predict a monthly increase "
-        "within the selected forecast period."
-    )
-# ============================================================
-# 19. FORECAST SUMMARY
-# ============================================================
-
-first_forecast = forecast_df.iloc[0]
-
-forecast_col1, forecast_col2, forecast_col3 = st.columns(3)
-
-with forecast_col1:
-    st.metric(
-        "Next Month's Forecast",
-        f"₱{first_forecast['predicted_price']:,.2f}/kg",
-        delta=(
-            f"₱{first_forecast['price_change']:+,.2f}/kg"
-        ),
-    )
-
-with forecast_col2:
-    st.metric(
-        "Forecast Month",
-        first_forecast[
-            "forecast_month"
-        ].strftime("%B %Y"),
-    )
-
-with forecast_col3:
-    st.metric(
-        "Forecast Direction",
-        first_forecast["direction"],
-    )
-# ============================================================
-# 20. FORECAST CHART
-# ============================================================
-
-st.subheader("Recorded Prices vs. Predicted Prices")
-
-observed_chart = monthly_df[
-    ["month", "palay_price_per_kg"]
-].copy()
-
-observed_chart = observed_chart.rename(
-    columns={
-        "month": "Month",
-        "palay_price_per_kg": "Recorded Price (₱/kg)",
-    }
-)
-
-observed_chart = observed_chart.set_index("Month")
-
-predicted_chart = forecast_df[
-    ["forecast_month", "predicted_price"]
-].copy()
-
-predicted_chart = predicted_chart.rename(
-    columns={
-        "forecast_month": "Month",
-        "predicted_price": "Predicted Price (₱/kg)",
-    }
-)
-
-predicted_chart = predicted_chart.set_index("Month")
-
-combined_chart = observed_chart.join(
-    predicted_chart,
-    how="outer",
+    hide_index=True,
 )
 
 st.line_chart(
-    combined_chart,
-    y=[
-        "Recorded Price (₱/kg)",
-        "Predicted Price (₱/kg)",
+    historical_df.set_index("price_date")[
+        "palay_price_per_kg"
     ],
+    y_label="Price per kg (₱)",
 )
+
+st.download_button(
+    label="Download Historical Prices (CSV)",
+    data=historical_df.to_csv(index=False).encode("utf-8"),
+    file_name="agritrack_historical_palay_prices.csv",
+    mime="text/csv",
+)
+
+st.divider()
+
+
 # ============================================================
-# 21. FORECAST TABLE
+# 8. PRICE FORECASTING
 # ============================================================
 
-st.subheader("Monthly Forecast Results")
+st.subheader("2. Future Palay Price Forecast")
 
-display_forecast = forecast_df.copy()
+bundle, model_error = get_model_bundle()
 
-display_forecast["forecast_month"] = (
-    display_forecast["forecast_month"]
-    .dt.strftime("%B %Y")
+if bundle is None:
+    st.warning(
+        "Historical prices are available, but forecasting is "
+        "not ready because the trained model could not be loaded."
+    )
+    st.code(model_error)
+    st.info(
+        "Train the model with train_model.py, save "
+        "palay_price_model.joblib, and push the model file to "
+        "the deployed app's repository."
+    )
+    st.stop()
+
+
+if len(historical_df) < 6:
+    st.warning(
+        f"Only {len(historical_df)} distinct monthly price "
+        "record(s) are available. This app requires at least "
+        "6 months before displaying a forecast. Save more real "
+        "selling records across different months first."
+    )
+    st.stop()
+
+
+horizon = st.selectbox(
+    "Forecast period",
+    options=[3, 6, 12],
+    format_func=lambda n: f"Next {n} months",
+    index=1,
 )
 
-display_forecast = display_forecast.rename(
-    columns={
-        "forecast_month": "Forecast Month",
-        "predicted_price": "Predicted Price (₱/kg)",
-        "previous_month_price": "Previous Price (₱/kg)",
-        "price_change": "Price Change (₱/kg)",
-        "direction": "Expected Direction",
-    }
+try:
+    forecast_df = forecast_prices(
+        history_df=historical_df,
+        bundle=bundle,
+        horizon=horizon,
+    )
+
+except Exception as exc:
+    st.error("Unable to generate a forecast.")
+    st.caption(str(exc))
+    st.info(
+        "Verify that the model's feature columns and feature "
+        "engineering match the training script."
+    )
+    st.stop()
+
+
+latest_month = historical_df["price_date"].max()
+last_actual_price = float(
+    historical_df.iloc[-1]["palay_price_per_kg"]
 )
 
-for column in [
-    "Predicted Price (₱/kg)",
-    "Previous Price (₱/kg)",
-    "Price Change (₱/kg)",
-]:
-    display_forecast[column] = display_forecast[
-        column
-    ].map(lambda value: f"₱{value:,.2f}")
+first_forecast = forecast_df.iloc[0]
+last_forecast = forecast_df.iloc[-1]
+
+first_forecast_price = float(
+    first_forecast["predicted_price_per_kg"]
+)
+
+change = first_forecast_price - last_actual_price
+change_percent = (
+    change / last_actual_price * 100
+    if last_actual_price > 0
+    else 0
+)
+
+forecast_cols = st.columns(3)
+
+forecast_cols[0].metric(
+    "Latest Actual Price",
+    f"₱{last_actual_price:,.2f}/kg",
+)
+
+forecast_cols[1].metric(
+    f"Forecast: {first_forecast['price_date']:%b %Y}",
+    f"₱{first_forecast_price:,.2f}/kg",
+    delta=f"{change:+.2f} ({change_percent:+.1f}%)",
+)
+
+forecast_cols[2].metric(
+    f"Forecast: {last_forecast['price_date']:%b %Y}",
+    f"₱{float(last_forecast['predicted_price_per_kg']):,.2f}/kg",
+)
+
+
+# Find the first predicted month with a higher price than
+# the latest actual recorded monthly price.
+increases = forecast_df[
+    forecast_df["predicted_price_per_kg"] > last_actual_price
+]
+
+if not increases.empty:
+    increase_row = increases.iloc[0]
+
+    st.success(
+        f"First forecast month above the latest actual price: "
+        f"{increase_row['price_date']:%B %Y}, at an estimated "
+        f"₱{increase_row['predicted_price_per_kg']:,.2f}/kg."
+    )
+else:
+    st.info(
+        "The model does not forecast a month above the latest "
+        "actual recorded price within this selected period."
+    )
+
+
+st.markdown("#### Forecast Table")
 
 st.dataframe(
-    display_forecast,
+    forecast_df.rename(
+        columns={
+            "price_date": "Forecast Month",
+            "predicted_price_per_kg": "Predicted Price (₱/kg)",
+        }
+    ),
     use_container_width=True,
     hide_index=True,
 )
 
+# Combine actual and forecast prices for visualization.
+actual_chart = historical_df[
+    ["price_date", "palay_price_per_kg"]
+].rename(
+    columns={
+        "price_date": "Month",
+        "palay_price_per_kg": "Actual Price (₱/kg)",
+    }
+).set_index("Month")
 
-# ============================================================
-# 22. DOWNLOAD FORECAST
-# ============================================================
+forecast_chart = forecast_df[
+    ["price_date", "predicted_price_per_kg"]
+].rename(
+    columns={
+        "price_date": "Month",
+        "predicted_price_per_kg": "Forecast Price (₱/kg)",
+    }
+).set_index("Month")
 
-download_df = forecast_df.copy()
-
-download_df["forecast_month"] = (
-    download_df["forecast_month"]
-    .dt.strftime("%Y-%m-01")
+combined_chart = actual_chart.join(
+    forecast_chart, how="outer"
 )
 
-forecast_csv = download_df.to_csv(
-    index=False
-).encode("utf-8")
+st.markdown("#### Actual vs. Forecast Price")
+st.line_chart(combined_chart)
 
 st.download_button(
-    label="Download Forecast Results (CSV)",
-    data=forecast_csv,
+    label="Download Forecast (CSV)",
+    data=forecast_df.to_csv(index=False).encode("utf-8"),
     file_name="agritrack_palay_price_forecast.csv",
     mime="text/csv",
 )
-# ============================================================
-# 23. DISCLAIMER
-# ============================================================
-
-st.divider()
 
 st.caption(
-    "Disclaimer: Forecasts are model estimates, not guaranteed "
-    "market prices. Actual palay prices can vary by location, "
-    "quality, moisture content, buyer, season, supply, and demand. "
-    "Forecast quality depends on the amount and quality of "
-    "historical training data."
+    "Forecasts are estimates generated by a trained machine "
+    "learning model, not guaranteed future market prices. "
+    "Accuracy depends on the quality, quantity, and time coverage "
+    "of actual historical selling-price records."
 )
+
+# Optional training metrics display.
+if METRICS_PATH.exists():
+    try:
+        import json
+
+        with open(METRICS_PATH, "r", encoding="utf-8") as file:
+            metrics = json.load(file)
+
+        with st.expander("Model training information"):
+            st.json(metrics)
+
+    except Exception:
+        pass
