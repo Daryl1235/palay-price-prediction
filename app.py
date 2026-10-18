@@ -1,4 +1,3 @@
-
 from pathlib import Path
 import calendar
 import os
@@ -71,9 +70,9 @@ response = requests.get(
     },
     timeout=30,
 )
-
 response.raise_for_status()
 payload = response.json()
+
 if response.status_code == 401:
         raise PermissionError(
             "API authentication failed. Check the API key in "
