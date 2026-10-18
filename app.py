@@ -73,6 +73,14 @@ response = requests.get(
 response.raise_for_status()
 payload = response.json()
 
+except requests.exceptions.RequestException as e:
+        st.error(
+            "Could not connect to the Agritrack API."
+            "Check the API URL, hosting status, and network connection."
+        )
+st.code(str(e))
+st.stop()
+
 if response.status_code == 401:
         raise PermissionError(
             "API authentication failed. Check the API key in "
