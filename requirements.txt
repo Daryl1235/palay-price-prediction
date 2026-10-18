@@ -3,4 +3,4 @@ numpy>=1.26,<3.0
 scikit-learn>=1.5,<2.0
 joblib>=1.4,<2.0
 streamlit>=1.40,<2.0
-requests
+requests>=2.31,<3.0
