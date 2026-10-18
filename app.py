@@ -229,11 +229,16 @@ def get_model_bundle():
 
         return bundle, None
 
-    except Exception as exc:
-        return None, (
-            "Unable to load the trained model: "
-            + str(exc)
-        )
+except Exception as exc:
+    st.error("Unable to load price data.")
+    st.write("Error type:", type(exc).__name__)
+    st.code(repr(exc))
+
+    if exc.__cause__ is not None:
+        st.write("Original error:")
+        st.code(repr(exc.__cause__))
+
+    st.stop()
 
 
 # ============================================================
