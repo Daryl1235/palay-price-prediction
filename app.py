@@ -65,8 +65,13 @@ def fetch_palay_prices(api_url, api_key):
     response = requests.get(
         api_url,
         headers={"X-API-Key": api_key},
+        "Accept": "application/json",
+        "User-Agent": "AgritrackPriceApp/1.0",
+        "Connection": "close",
+        }
         timeout=30,
     )
+    response.raise_for_status()
 
     if response.status_code == 401:
         raise PermissionError(
